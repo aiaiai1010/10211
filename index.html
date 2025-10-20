@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>首姿勢＋顔距離(Z)判定｜9月改良版（閾値補正・フィルタリング・持続警告）</title>
+  <style>
+    :root { --w: 240px; --h: 320px; }
+
+    body {
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Noto Sans JP", "Apple Color Emoji", "Segoe UI Emoji";
+      font-size: 18px; margin: 0; color: #111; background: #fafafa;
+    }
+    header { padding: 12px 16px; background: #fff; border-bottom: 1px solid #eee; position: sticky; top: 0; z-index: 10; }
+    h1 { font-size: 20px; margin: 0; }
+
+    main { display: grid; grid-template-columns: 1fr; gap: 12px; padding: 12px; place-items: center; }
+
+    /* ステージは縦に並べ、映像ペアだけ横並びにする */
+    .stage { display: flex; flex-direction: column; gap: 8px; align-items: center; }
+
+    .pair {
+      display: flex; gap: 8px; align-items: center; justify-content: center;
+      flex-direction: row; /* 幅が狭いときは縦に折り返し */
+    }
+
+    video, canvas {
+      transform: scaleX(-1);
+      width: var(--w); height: var(--h);
+      border: 1px solid #ddd; background: #000; border-radius: 6px;
+    }
+
+    .controls { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
+    button { font-size: 15px; padding: 8px 14px; border-radius: 10px; border: 1px solid #ccc; background: #fff; cursor: pointer; }
+    button.primary { background: #0ea5e9; color: #fff; border-color: #0ea5e9; }
+    button:disabled { opacity: .6; cursor: not-allowed; }
+
+    .panel { width: min(680px, 92vw); background: #fff; border: 1px solid #eee; border-radius: 12px; padding: 12px; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-line; }
+
+    #warning { font-size: 24px; font-weight: 800; text-align: center; margin: 4px 0 0; }
+    .ok { color: #16a34a; }
+    .bad { color: #dc2626; }
+
+    .hint { color: #666; font-size: 13px; }
+    .badge { display:inline-block; padding:2px 8px; border-radius:999px; background:#f1f5f9; font-size:12px; }
+
+    /* スマホ幅は強制縦並びにしたい場合 */
+    @media (max-width: 760px) {
+      .pair { flex-direction: column; flex-wrap: nowrap; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>首姿勢＋顔距離(Z)判定｜（1）9月改良版 <span class="badge">閾値補正/フィルタ/持続警告</span></h1>
+  </header>
+
+  <main>
+    <section class="stage">
+      <div class="controls">
+        <button id="startBtn" class="primary">測定開始</button>
+        <button id="calibBtn" disabled>正しい姿勢の基準</button>
+        <button id="resetBtn" disabled>解除</button>
+      </div>
+
+      <!-- ⬇ 映像ペアだけ横並び ⬇ -->
+      <div class="pair">
+        <video id="video" autoplay muted playsinline></video>
+        <canvas id="canvas"></canvas>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div id="warning" class="ok">測定待機中</div>
+      <div class="row">
+        <div>
+          <h3>現在値</h3>
+          <div id="output" class="mono">読み取り中...</div>
+        </div>
+      </div>
+      <p class="hint">使い方：<strong>測定開始</strong> → 楽な正しい姿勢で <strong>ニュートラルをキャリブレーション</strong>（任意）→ 不要なら <strong>キャリブ解除</strong>。iOS は開始時にセンサー許可が必要です。</p>
+    </section>
+  </main>
+
+  <!-- MediaPipe -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+
+  <script>
+    const PARAMS = {
+      alphaPitch: 0.25, alphaRoll: 0.25, alphaYdiff: 0.3, alphaNoseZ: 0.25,
+      calibYdiff: null, calibNoseZ: null,
+      downEnter: -0.035, downExit: -0.020, upEnter: 0.045, upExit: 0.030,
+      absDownEnter: 0.10, absUpEnter: 0.20, absExitBand: 0.02,
+      closeEnter: -0.035, closeExit: -0.015, farEnter: 0.020, farExit: 0.005,
+      absCloseEnter: -0.15, absFarEnter: -0.10, absZExitBand: 0.02,
+      sustainMs: 900, clearMs: 900,
+    };
+
+    const video  = document.getElementById('video');
+    const canvas = document.getElementById('canvas');
+    const ctx    = canvas.getContext('2d');
+    const output = document.getElementById('output');
+    const warning= document.getElementById('warning');
+    const startBtn = document.getElementById('startBtn');
+    const calibBtn = document.getElementById('calibBtn');
+    const resetBtn = document.getElementById('resetBtn');
+
+    let rawPitch=0, rawRoll=0;
+    let sPitch=0, sRoll=0, sYdiff=null, sNoseZ=null;
+    let faceState = { dir: 'straight', prox: '通常距離' };
+    let bentState = false;
+    let enterStart = null, exitStart  = null;
+    let wasDown = false, wasUp = false, wasClose = false, wasFar = false;
+
+    function handleOrientation(e){
+      rawPitch = (e.beta  ?? 0);
+      rawRoll  = (e.gamma ?? 0);
+      sPitch = PARAMS.alphaPitch * rawPitch + (1 - PARAMS.alphaPitch) * sPitch;
+      sRoll  = PARAMS.alphaRoll  * rawRoll  + (1 - PARAMS.alphaRoll ) * sRoll;
+    }
+
+    const faceMesh = new FaceMesh({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${f}` });
+    faceMesh.setOptions({ maxNumFaces: 1, refineLandmarks: false, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+
+    faceMesh.onResults(results => {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(results.image, 0, 0, canvas.width, canvas.height);
+
+      if (!results.multiFaceLandmarks || results.multiFaceLandmarks.length === 0) {
+        setWarning(false, '顔が検出できません');
+        output.textContent = '顔が見つかりません';
+        return;
+      }
+
+      const lm = results.multiFaceLandmarks[0];
+      const nose = lm[1];
+      const chin = lm[152];
+
+      drawPoint(nose, '#22c55e');
+      drawPoint(chin, '#2563eb');
+
+      const yDiff = (chin.y - nose.y);
+      const noseZ = nose.z;
+
+      sYdiff = (sYdiff == null) ? yDiff : PARAMS.alphaYdiff * yDiff + (1 - PARAMS.alphaYdiff) * sYdiff;
+      sNoseZ = (sNoseZ == null) ? noseZ : PARAMS.alphaNoseZ * noseZ + (1 - PARAMS.alphaNoseZ) * sNoseZ;
+
+      const dir = classifyDirection(sYdiff);
+      faceState.dir = dir;
+      const prox = classifyProximity(sNoseZ);
+      faceState.prox = prox;
+
+      const isBentNow = isBent(faceState.dir, faceState.prox, sPitch);
+      updateSustain(isBentNow);
+
+      output.textContent =
+        `Pitch: ${sPitch.toFixed(2)}°\n` +
+        `Roll:  ${sRoll.toFixed(2)}°\n` +
+        `yDiff(平滑): ${sYdiff.toFixed(4)}\n` +
+        `noseZ(平滑): ${sNoseZ.toFixed(4)}\n` +
+        `顔向き: ${faceState.dir}\n` +
+        `顔距離: ${faceState.prox}`;
+    });
+
+    function drawPoint(normLandmark, color) {
+      const x = normLandmark.x * canvas.width;
+      const y = normLandmark.y * canvas.height;
+      ctx.beginPath(); ctx.arc(x, y, 4, 0, Math.PI * 2); ctx.fillStyle = color; ctx.fill();
+    }
+
+    function classifyDirection(y) {
+      if (PARAMS.calibYdiff != null) {
+        const dy = y - PARAMS.calibYdiff;
+        if (!wasDown && dy <= PARAMS.downEnter) { wasDown = true; wasUp = false; return 'down'; }
+        if (wasDown && dy >= PARAMS.downExit)  { wasDown = false; }
+        if (!wasUp && dy >= PARAMS.upEnter)    { wasUp = true; wasDown = false; return 'up'; }
+        if (wasUp && dy <= PARAMS.upExit)      { wasUp = false; }
+        if (wasDown) return 'down';
+        if (wasUp)   return 'up';
+        return 'straight';
+      } else {
+        const lower = PARAMS.absDownEnter, upper = PARAMS.absUpEnter, band = PARAMS.absExitBand;
+        if (!wasDown && y < lower) { wasDown = true; wasUp = false; return 'down'; }
+        if (wasDown && y > lower + band) { wasDown = false; }
+        if (!wasUp && y > upper)  { wasUp = true; wasDown = false; return 'up'; }
+        if (wasUp && y < upper - band) { wasUp = false; }
+        if (wasDown) return 'down';
+        if (wasUp)   return 'up';
+        return 'straight';
+      }
+    }
+
+    function classifyProximity(z) {
+      if (PARAMS.calibNoseZ != null) {
+        const dz = z - PARAMS.calibNoseZ;
+        if (!wasClose && dz <= PARAMS.closeEnter) { wasClose = true; wasFar = false; return '顔が近い'; }
+        if (wasClose && dz >= PARAMS.closeExit)   { wasClose = false; }
+        if (!wasFar && dz >= PARAMS.farEnter)     { wasFar = true; wasClose = false; return '顔が遠い'; }
+        if (wasFar && dz <= PARAMS.farExit)       { wasFar = false; }
+        if (wasClose) return '顔が近い';
+        if (wasFar)   return '顔が遠い';
+        return '通常距離';
+      } else {
+        const close = PARAMS.absCloseEnter, far = PARAMS.absFarEnter, band = PARAMS.absZExitBand;
+        if (!wasClose && z < close) { wasClose = true; wasFar = false; return '顔が近い'; }
+        if (wasClose && z > close + band) { wasClose = false; }
+        if (!wasFar && z > far) { wasFar = true; wasClose = false; return '顔が遠い'; }
+        if (wasFar && z < far - band) { wasFar = false; }
+        if (wasClose) return '顔が近い';
+        if (wasFar)   return '顔が遠い';
+        return '通常距離';
+      }
+    }
+
+    function isBent(dir, prox, pitch){
+      if (prox === '顔が近い' && pitch <= 30) return true;
+      if (pitch <= 40) return (dir === 'down' || dir === 'straight');
+      return (dir === 'down');
+    }
+
+    function updateSustain(isNow){
+      const t = performance.now();
+      if (isNow) {
+        if (enterStart == null) enterStart = t;
+        exitStart = null;
+        const elapsed = t - enterStart;
+        if (!bentState && elapsed >= PARAMS.sustainMs) {
+          bentState = true;
+          setWarning(true, '首が曲がっています');
+        }
+      } else {
+        if (exitStart == null) exitStart = t;
+        enterStart = null;
+        const elapsed = t - exitStart;
+        if (bentState && elapsed >= PARAMS.clearMs) {
+          bentState = false;
+          setWarning(false, '首は曲がっていません');
+        }
+        if (!bentState) setWarning(false, '首は曲がっていません');
+      }
+    }
+
+    function setWarning(bad, text){
+      warning.textContent = text;
+      warning.className = bad ? 'bad' : 'ok';
+    }
+
+    async function initCamera(){
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false });
+      video.srcObject = stream;
+      await new Promise(r => video.onloadedmetadata = r);
+      canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+    }
+
+    async function startAll(){
+      if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function'){
+        try {
+          const res = await DeviceOrientationEvent.requestPermission();
+          if (res === 'granted') window.addEventListener('deviceorientation', handleOrientation);
+          else { output.textContent = 'センサーの利用が許可されませんでした。'; return; }
+        } catch { output.textContent = 'センサー許可でエラーが発生しました。'; return; }
+      } else {
+        window.addEventListener('deviceorientation', handleOrientation);
+      }
+
+      await initCamera();
+
+      const camera = new Camera(video, {
+        onFrame: async () => { await faceMesh.send({ image: video }); },
+        width: 640, height: 480
+      });
+      camera.start();
+
+      startBtn.disabled = true; calibBtn.disabled = false; resetBtn.disabled = false;
+      setWarning(false, '測定中...');
+
+      const saved = loadCalibration();
+      if (saved) { PARAMS.calibYdiff = saved.y; PARAMS.calibNoseZ = saved.z; }
+    }
+
+    function calibrate(){
+      if (sYdiff == null || sNoseZ == null) return;
+      PARAMS.calibYdiff = sYdiff; PARAMS.calibNoseZ = sNoseZ;
+      saveCalibration(PARAMS.calibYdiff, PARAMS.calibNoseZ);
+      setWarning(false, 'ニュートラルを登録しました');
+    }
+
+    function resetCalibration(){
+      PARAMS.calibYdiff = null; PARAMS.calibNoseZ = null;
+      localStorage.removeItem('posture-calib');
+      setWarning(false, 'キャリブを解除しました');
+    }
+
+    function saveCalibration(y, z){ try { localStorage.setItem('posture-calib', JSON.stringify({ y, z })); } catch {} }
+    function loadCalibration(){ try { return JSON.parse(localStorage.getItem('posture-calib')); } catch { return null; } }
+
+    window.addEventListener('load', () => {
+      startBtn.addEventListener('click', startAll);
+      calibBtn.addEventListener('click', calibrate);
+      resetBtn.addEventListener('click', resetCalibration);
+    });
+  </script>
+</body>
+</html>
