@@ -89,6 +89,9 @@
     </section>
   </main>
 
+  <!-- ▼ 効果音ファイル（GitHub Pagesなら ./assets/alert.mp3 に置く） ▼ -->
+  <audio id="alertSound" src="./assets/alert.mp3" preload="auto"></audio>
+
   <!-- MediaPipe -->
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
@@ -98,13 +101,12 @@
     const PARAMS = {
       alphaPitch: 0.25, alphaRoll: 0.25, alphaYdiff: 0.3, alphaNoseZ: 0.25,
       calibYdiff: null, calibNoseZ: null,
-      // 既存しきい値（距離・ヒステリシス等で使用）
       absExitBand: 0.02,
       closeEnter: -0.035, closeExit: -0.015, farEnter: 0.020, farExit: 0.005,
       absCloseEnter: -0.15, absFarEnter: -0.10, absZExitBand: 0.02,
       sustainMs: 10, clearMs: 10,
-      // ★ 追加：警告音設定
-      beep: { intervalMs: 500, freq: 880, dur: 0.3, gain: 0.08 },
+      // ★ 警告音の間隔（MP3でも流用）
+      beep: { intervalMs: 8000, freq: 880, dur: 0.3, gain: 0.08 },
     };
 
     const video  = document.getElementById('video');
@@ -128,49 +130,43 @@
     let camera = null;
     let lastInferenceTs = 0; // FPS制限
 
-    // ★ 追加：顔検出フラグ
+    // 顔検出フラグ
     let faceDetected = false;
 
-    // ======== 警告音（Web Audio） ========
-    let audioCtx = null;
-    let beepInterval = null;
+    // ======== 効果音（MP3） ========
+    let alertInterval = null;
 
-    function ensureAudio() {
+    function playAlert() {
+      const el = document.getElementById('alertSound');
+      if (!el) return;
+      el.currentTime = 0;                   // 先頭から
+      el.play().catch(e => console.warn('音再生がブロック:', e));
+    }
+
+    function startAlertLoop() {
+      if (alertInterval) return;
+      playAlert(); // 入りで1回
+      alertInterval = setInterval(playAlert, PARAMS.beep.intervalMs); // ← 間隔はPARAMSを流用
+    }
+
+    function stopAlertLoop() {
+      if (alertInterval) { clearInterval(alertInterval); alertInterval = null; }
+    }
+
+    // iOS/Safariの自動再生制限回避：ユーザー操作直後に無音再生→停止
+    async function primeHtmlAudioByUserGesture() {
+      const el = document.getElementById('alertSound');
+      if (!el) return;
+      const prev = el.volume;
       try {
-        if (!audioCtx) {
-          audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-        }
-        if (audioCtx.state === 'suspended') {
-          audioCtx.resume?.();
-        }
-      } catch (e) {
-        console.warn('AudioContext 初期化に失敗:', e);
-        audioCtx = null;
-      }
-    }
-
-    function playBeep() {
-      if (!audioCtx) return;
-      const { freq, dur, gain } = PARAMS.beep;
-      const osc = audioCtx.createOscillator();
-      const g   = audioCtx.createGain();
-      osc.type = 'sine';
-      osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
-      g.gain.setValueAtTime(gain, audioCtx.currentTime);
-      osc.connect(g).connect(audioCtx.destination);
-      osc.start();
-      osc.stop(audioCtx.currentTime + dur);
-      osc.onended = () => { try { osc.disconnect(); g.disconnect(); } catch {} };
-    }
-
-    function startBeepLoop() {
-      if (beepInterval) return;
-      playBeep(); // 入りで1回
-      beepInterval = setInterval(playBeep, PARAMS.beep.intervalMs);
-    }
-
-    function stopBeepLoop() {
-      if (beepInterval) { clearInterval(beepInterval); beepInterval = null; }
+        el.volume = 0;
+        await el.play();
+      } catch (_) {}
+      try {
+        el.pause();
+        el.currentTime = 0;
+      } catch (_) {}
+      el.volume = prev;
     }
 
     // ========== センサー ==========
@@ -195,12 +191,12 @@
       ctx.drawImage(results.image, 0, 0, canvas.width, canvas.height);
 
       if (!results.multiFaceLandmarks || results.multiFaceLandmarks.length === 0) {
-        faceDetected = false; // ★ 顔なし
+        faceDetected = false;
         setWarning(true, '顔が検出できません');
         output.textContent = '顔が見つかりません';
         return;
       }
-      faceDetected = true; // ★ 顔あり
+      faceDetected = true;
 
       const lm = results.multiFaceLandmarks[0];
       const nose = lm[1];
@@ -216,15 +212,15 @@
       sNoseZ = (sNoseZ == null) ? noseZ : PARAMS.alphaNoseZ * noseZ + (1 - PARAMS.alphaNoseZ) * sNoseZ;
 
       // 顔向き & 距離の分類
-      const dir = classifyDirection();     // ← combined 判定
+      const dir = classifyDirection();
       faceState.dir = dir;
       const prox = classifyProximity(sNoseZ);
       faceState.prox = prox;
 
-      // スマホ角度も考慮した首曲がり最終判定
+      // 端末角度も考慮した首曲がり最終判定
       const pitchAbs = Math.abs(sPitch);
       const isBentNow = isBent(faceState.dir, faceState.prox, pitchAbs);
-      updateSustain(isBentNow); // ★ 表示更新はこの中で毎フレーム同期
+      updateSustain(isBentNow); // 表示更新はこの中で毎フレーム同期
 
       // デバッグ出力
       const combined = getCombinedForDebug();
@@ -306,7 +302,7 @@
       return (dir === 'down');
     }
 
-    // ★ 修正：表示は毎フレーム同期。顔が見えていれば bentState の内容で常に上書き。
+    // ★ 表示/音：状態遷移時に alert.mp3 を制御
     function updateSustain(isNow){
       const t = performance.now();
       if (isNow) {
@@ -315,8 +311,8 @@
         const elapsed = t - enterStart;
         if (!bentState && elapsed >= PARAMS.sustainMs) {
           bentState = true;
-          setWarning(true, '首が曲がっています'); // 入口で1回
-          startBeepLoop(); // ★ 追加：一定間隔でビープ開始
+          setWarning(true, '首が曲がっています'); // 入口
+          startAlertLoop(); // ★ MP3ループ開始（単発なら playAlert() に変更）
         }
       } else {
         if (exitStart == null) exitStart = t;
@@ -324,21 +320,15 @@
         const elapsed = t - exitStart;
         if (bentState && elapsed >= PARAMS.clearMs) {
           bentState = false;
-          setWarning(false, '首は曲がっていません'); // 退出で1回
-          stopBeepLoop(); // ★ 追加：停止
+          setWarning(false, '首は曲がっていません'); // 退出
+          stopAlertLoop(); // ★ MP3ループ停止
         }
       }
 
-      // ★ 毎フレーム：顔が見えている間は最新状態を反映
+      // 顔が見えていれば毎フレーム反映
       if (faceDetected) {
         setWarning(bentState, bentState ? '首が曲がっています' : '首は曲がっていません');
       }
-    }
-
-    // 任意で即時更新したいとき用
-    function refreshWarningNow(){
-      if (!faceDetected) return;
-      setWarning(bentState, bentState ? '首が曲がっています' : '首は曲がっていません');
     }
 
     function setWarning(bad, text){
@@ -359,6 +349,7 @@
     }
 
     async function startAll(){
+      // iOS (Safari) のセンサー許可
       if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function'){
         try {
           const res = await DeviceOrientationEvent.requestPermission();
@@ -371,8 +362,8 @@
 
       await initCamera();
 
-      // ★ 追加：ユーザー操作直後にオーディオを有効化（iOS自動再生制限対策）
-      ensureAudio();
+      // ★ iOS/Safari の自動再生制限を回避（ユーザー操作直後に無音再生→停止）
+      await primeHtmlAudioByUserGesture();
 
       camera = new Camera(video, {
         onFrame: async () => {
@@ -390,18 +381,15 @@
       const saved = loadCalibration();
       if (saved) {
         PARAMS.calibYdiff = saved.y; PARAMS.calibNoseZ = saved.z;
-        setWarning(false, '測定中...');
-      } else {
-        setWarning(false, '測定中...');
       }
+      setWarning(false, '測定中...');
 
-      // タブ非表示で一時停止／復帰
+      // タブ非表示で音が鳴りっぱなしにならないように停止
       document.addEventListener('visibilitychange', () => {
         if (!camera) return;
         if (document.hidden) {
           try { camera.stop(); } catch {}
-          // ★ 追加：バックグラウンドで鳴りっぱなし防止
-          stopBeepLoop();
+          stopAlertLoop(); // ★ バックグラウンドで停止
         } else {
           try { camera.start(); } catch {}
         }
@@ -453,7 +441,6 @@
       return `${y}-${m}-${day}`;
     }
 
-    // ★ JST(+09:00) の ISO風文字列（ミリ秒付き）
     function toJstIso(ts){
       const d = new Date(ts);
       const parts = Object.fromEntries(
@@ -525,7 +512,7 @@
           const v = cur.value;
           rows.push([
             v.ts,
-            toJstIso(v.ts), // ★ JST で出力
+            toJstIso(v.ts),
             v.day,
             v.hour,
             v.pitch?.toFixed?.(3),
@@ -694,14 +681,12 @@
 
       if (logStartBtn) logStartBtn.addEventListener('click', async ()=>{
         LOGGING = true; lastLogAt = 0; lastFlush = 0;
-        // setWarning は使わない（表示を壊さない）
         output.textContent += '\n[LOG] ログ記録を開始しました';
         logStartBtn.disabled = true; logStopBtn.disabled  = false;
       });
 
       if (logStopBtn) logStopBtn.addEventListener('click', async ()=>{
         LOGGING = false; await flushLogs();
-        // setWarning は使わない（表示を壊さない）
         output.textContent += '\n[LOG] ログ記録を停止しました';
         logStartBtn.disabled = false; logStopBtn.disabled  = true;
       });
