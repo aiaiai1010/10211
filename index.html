@@ -185,10 +185,10 @@
     function classifyDirection(){
       const combined=(sYdiff??0)+(sNoseZ??0);
       const band=PARAMS.absExitBand;
-      if(!wasDown&&combined<0.04){wasDown=true;wasUp=false;return'down';}
-      if(wasDown&&combined>0.04+band){wasDown=false;}
-      if(!wasUp&&combined>0.14){wasUp=true;wasDown=false;return'up';}
-      if(wasUp&&combined<0.14-band){wasUp=false;}
+      if(!wasDown&&combined<-0.04){wasDown=true;wasUp=false;return'down';}
+      if(wasDown&&combined>-0.04+band){wasDown=false;}
+      if(!wasUp&&combined>0.05){wasUp=true;wasDown=false;return'up';}
+      if(wasUp&&combined<0.05-band){wasUp=false;}
       if(wasDown)return'down';
       if(wasUp)return'up';
       return'straight';
